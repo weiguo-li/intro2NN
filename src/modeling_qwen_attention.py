@@ -1,3 +1,7 @@
+"""
+The following code will modify the correponding qwen attention during run time via the so called "Monkey Patching" mechanism. 
+"""
+
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 from transformers.utils.deprecation import deprecate_kwarg
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
@@ -8,6 +12,7 @@ from transformers.integrations import use_kernel_forward_from_hub
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from transformers.utils import TransformersKwargs
+from einops import rearrange
 
 
 @use_kernel_forward_from_hub("RMSNorm")
@@ -35,7 +40,7 @@ class Qwen3Attention_v1(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper
     code is borrowed from huggingface transformers
 
-    I(wli) will modify this part in order to make it more readable
+    I(wli) will modify this part in order to make it more readable and clear
     """
 
     def __init__(self, config: Qwen3Config, layer_idx: int):
@@ -95,18 +100,20 @@ class Qwen3Attention_v1(nn.Module):
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         
-        # print(f"customized attention layer {self.layer_idx} is called"). # for debug
+        # print(f"customized attention layer is called") # for debug
 
-        input_shape = hidden_states.shape[:-1]
-        hidden_shape = (*input_shape, -1, self.head_dim)
+        input_shape = hidden_states.shape[:-1]  # (batch_size, seq_length)
+        hidden_shape = (*input_shape, -1, self.head_dim) #(batch_size, seq_length, -1, head_dim)
 
         query_states = self.q_norm(
-            self.q_proj(hidden_states).view(hidden_shape)
-        ).transpose(1, 2)
+            rearrange(self.q_proj(hidden_states), 'b l (n_head head_dim) -> b n_head l head_dim', head_dim = self.head_dim)
+        )
         key_states = self.k_norm(
-            self.k_proj(hidden_states).view(hidden_shape)
-        ).transpose(1, 2)
-        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+            rearrange(self.k_proj(hidden_states), 'b l (n_head head_dim) -> b n_head l head_dim', head_dim = self.head_dim)
+        )
+        value_states = rearrange(
+            self.v_proj(hidden_states), 'b l (n_head  head_dim) -> b n_head l head_dim', head_dim = self.head_dim
+        )
 
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(
@@ -138,12 +145,8 @@ class Qwen3Attention_v1(nn.Module):
             **kwargs,
         )
 
-        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+        attn_output = rearrange(attn_output, "b seq_len num_heads head_dim -> b seq_len (num_heads head_dim)").contiguous()
         attn_output = self.o_proj(attn_output)
-
-        # # Store raw attention weights if enabled
-        # if self.store_raw_weights:
-        #     self.last_raw_weights = attn_weights
 
         return attn_output, attn_weights
 
@@ -175,6 +178,8 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     return q_embed, k_embed
 
 
+
+# for  grouped or multi-query attention
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     """
     This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
@@ -183,10 +188,9 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     batch, num_key_value_heads, slen, head_dim = hidden_states.shape
     if n_rep == 1:
         return hidden_states
-    hidden_states = hidden_states[:, :, None, :, :].expand(
-        batch, num_key_value_heads, n_rep, slen, head_dim
-    )
-    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+
+    hidden_states = rearrange(hidden_states, 'b num_heads l head_dim -> b num_heads 1 l head_dim').expand(batch, num_key_value_heads, n_rep, slen,head_dim)
+    return rearrange(hidden_states,'b num_heads n_rep l head_dim -> b (num_heads n_rep) l head_dim')
 
 
 def eager_attention_forward(
@@ -202,8 +206,9 @@ def eager_attention_forward(
     key_states = repeat_kv(key, module.num_key_value_groups)
     value_states = repeat_kv(value, module.num_key_value_groups)
 
-    # Raw attention weights before softmax
-    attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
+    # l == s True
+    attn_weights = torch.einsum('bhld, bhsd -> bhls', [query,key_states]) * scaling
+
     if attention_mask is not None:
         causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
         attn_weights= attn_weights + causal_mask
@@ -216,12 +221,13 @@ def eager_attention_forward(
     )
     attn_output = torch.matmul(attn_weights, value_states)
     attn_output = attn_output.transpose(1, 2).contiguous()
+    attn_output = torch.einsum('bhls, bhsd -> bhld ', [attn_weights, value_states])
+    attn_output = rearrange(attn_output, 'b num_heads seq_len head_dim -> b  seq_len num_heads head_dim').contiguous()
 
     return attn_output, attn_weights
 
 def rotate_half(x):
     """Rotates half the hidden dims of the input."""
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
+    x_rearranged = rearrange(x, "... (a d_half) -> ... d_half a", a = 2)
+    return torch.cat((-x_rearranged[...,1], x_rearranged[..., 0]), dim = -1)
 
