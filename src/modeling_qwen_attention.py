@@ -13,7 +13,7 @@ import torch
 from transformers.integrations import use_kernel_forward_from_hub
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
-from transformers.utils import TransformersKwargs
+# from transformers.utils import TransformersKwargs
 from einops import rearrange
 
 
