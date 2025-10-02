@@ -7,12 +7,23 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 import numpy as np
 from tqdm import trange
 
+from transformers.models.qwen3 import modeling_qwen3
+from modeling_qwen_attention import Qwen3Attention_v1
+modeling_qwen3.Qwen3Attention = Qwen3Attention_v1
+from reward_model import OutcomeRewardModel
+from torch.utils.data import Dataset, DataLoader
+
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 # ----------------- Config -----------------
+model_path = "/home/students/wli/UniHeidelberg/semster2/final_projects/models/Qwen3-0.6B-Base"
 POLICY_MODEL = "Qwen/Qwen3-0.6B"        # policy backbone (small for testing)
 REF_MODEL = "Qwen/Qwen3-0.6B"           # reference model (same arch, frozen)
 TOKENIZER_NAME = "Qwen/Qwen3-0.6B"
+POLICY_MODEL = model_path
+REF_MODEL = model_path
+TOKENIZER_NAME = model_path
+
 
 RM_CALLABLE = None           # placeholder: function(prompt, response) -> float reward
 MAX_GEN_LEN = 64
@@ -58,8 +69,8 @@ class PolicyWithValue(nn.Module):
     def forward(self, input_ids, attention_mask=None):
         # returns logits (for next token) and value for last token
         outputs = self.lm(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states = True)
-        hidden_states = outputs.hid  # (B, T, H)
-        logits = output.logits    # (B, T, V)
+        hidden_states = outputs.hidden_states[-1]  #  (B, T, H)
+        logits = outputs.logits    # (B, T, V)
         # value: use last non-padded token hidden
         if attention_mask is not None:
             lengths = attention_mask.sum(dim=1) - 1
@@ -79,7 +90,8 @@ optimizer = torch.optim.AdamW(policy.parameters(), lr=LR)
 @torch.no_grad()
 def ref_log_probs_for_tokens(input_ids, attention_mask):
     # compute reference model logits for input_ids and return log-prob of each token under ref
-    logits = ref_lm(input_ids=input_ids, attention_mask=attention_mask)
+    output = ref_lm(input_ids=input_ids, attention_mask=attention_mask)
+    logits = output.logits
     log_probs = F.log_softmax(logits, dim=-1)
     # gather log-probs of the actual tokens (shifted)
     # we want logprob of token t given prefix up to t-1. For autoreg, we shift appropriately:
@@ -124,7 +136,8 @@ def sample_episode(prompt, max_new_tokens=MAX_GEN_LEN):
         logp = float(cat.log_prob(torch.tensor(chosen, device=device)).item())
         # reference logprob for the same token
         with torch.no_grad():
-            ref_logits = ref_lm(cur_input, attention_mask = cur_attn)[0, -1, :]
+            ref_output = ref_lm(cur_input, attention_mask=cur_attn)
+            ref_logits = ref_output.logits[0, -1, :]
             ref_logp = float(F.log_softmax(ref_logits, dim=-1)[chosen].item())
 
         # append
@@ -174,7 +187,7 @@ def compute_gae(rewards, values, gamma=GAMMA, lam=GAE_LAMBDA):
         else:
             next_value = values[t+1]
             next_non_terminal = 1.0
-        delta = rewards[t] + gamma * next_value * next_non_terminal - values[t]
+        delta = rewards[t] + gamma * next_value * next_non_terminal - values[t] # this is the advantage trick term
         lastgaelam = delta + gamma * lam * next_non_terminal * lastgaelam
         advantages[t] = lastgaelam
     returns = advantages + values
@@ -206,7 +219,7 @@ def ppo_update(episodes, ppo_epochs=PPO_EPOCHS, minibatch_size=MINIBATCH_SIZE):
         rewards = np.zeros(T, dtype=np.float32)
         rewards[-1] = R
         values = ep["values"]
-        returns, advs = compute_gae(rewards, values, gamma=GAMMA, lam=GAE_LAMBDA)
+        returns, advs = compute_gae(rewards, values, gamma=GAMMA, lam=GAE_LAMBDA) # Q_t, A_t
 
         logps_old.extend(ep["logps"].tolist())
         ref_logps_arr.extend(ep["ref_logps"].tolist())
@@ -237,9 +250,10 @@ def ppo_update(episodes, ppo_epochs=PPO_EPOCHS, minibatch_size=MINIBATCH_SIZE):
     # optimized implementation caches hidden states. For clarity we re-tokenize each full sequence up to step t.
     # This is slower but simpler to implement.
 
-    # Build arrays of prefixes to evaluate
+    # Build arrays of prefixes to evaluate and corresponding actions
     prefixes = []
     prefix_lens = []
+    actions = []  # the action (token) taken at each step
     for ep in episodes:
         # need the initial prompt token ids
         prompt_ids = tokenizer(ep["prompt"], return_tensors="pt").input_ids[0].tolist()
@@ -248,76 +262,11 @@ def ppo_update(episodes, ppo_epochs=PPO_EPOCHS, minibatch_size=MINIBATCH_SIZE):
         for t, tok in enumerate(ep["generated_ids"]):
             prefixes.append(accum.copy())       # state before taking action t
             prefix_lens.append(len(accum))
+            actions.append(int(tok))            # action taken at step t
             accum.append(int(tok))
 
     assert len(prefixes) == N
-
-    # Precompute logits & values for all prefixes in minibatches
-    def eval_prefixes(prefix_list, batch_size=16):
-        cur_logps = []
-        cur_values = []
-        cur_ref_logps = []
-        for i in range(0, len(prefix_list), batch_size):
-            batch = prefix_list[i:i+batch_size]
-            # pad to max len inside batch
-            maxlen = max(len(x) for x in batch)
-            input_ids = []
-            attn = []
-            for seq in batch:
-                padded = seq + [tokenizer.pad_token_id] * (maxlen - len(seq))
-                input_ids.append(padded)
-                attn.append([1]*len(seq) + [0]*(maxlen - len(seq)))
-            input_ids = torch.tensor(input_ids, device=device)
-            attn = torch.tensor(attn, device=device)
-            with torch.no_grad():
-                logits, values = policy(input_ids, attention_mask=attn)  # logits (B, L, V), values (B,)
-                # we need the logits for the last position to compute logprob of the action that followed
-                last_logits = logits[range(len(batch)), [ (sum(a)-1) for a in attn.cpu().numpy() ], :]  # hacky but works
-                # Actually easier: the position of last real token is prefix_len-1, but we recorded prefix_len separately possibly
-                # But above we used full attention masks, so extract last real index per sequence:
-                last_positions = attn.sum(dim=1).long() - 1
-                last_logits = logits[range(len(batch)), last_positions, :]  # (B, V)
-                logp = F.log_softmax(last_logits, dim=-1)
-                # For values we have value_head already returned as values
-                # But our policy.forward returns values for the last token; we can reuse values
-                # Save:
-                cur_values.extend(values.cpu().numpy().tolist())
-                cur_logps.extend(logp.cpu().numpy().tolist())   # store logprob distribution for each prefix
-
-                # reference logits
-                # compute ref logits similarly
-                ref_logits = ref_lm(rinput_ids=input_ids, attention_mask=attn)
-                last_positions = attn.sum(dim=1).long() - 1
-                ref_last_logits = ref_logits[range(len(batch)), last_positions, :]
-                cur_ref_logps.extend(F.log_softmax(ref_last_logits, dim=-1).cpu().numpy().tolist())
-        return cur_logps, cur_values, cur_ref_logps
-
-    # Evaluate prefix distributions
-    prefix_logp_dists, prefix_values, prefix_ref_logp_dists = eval_prefixes(prefixes, batch_size=8)
-
-    # Now extract logprob of the *action that was taken* from distributions
-    logp_current = []
-    ref_logp_current = []
-    k = 0
-    for ep in episodes:
-        for tok in ep["generated_ids"]:
-            dist = prefix_logp_dists[k]   # numpy array vector of size V
-            ref_dist = prefix_ref_logp_dists[k]
-            logp_current.append(float(dist[int(tok)]))
-            ref_logp_current.append(float(ref_dist[int(tok)]))
-            k += 1
-
-    logp_current_t = torch.tensor(logp_current, device=device)
-    ref_logp_current_t = torch.tensor(ref_logp_current, device=device)
-    values_current_t = torch.tensor(prefix_values, device=device)
-
-    # compute entropy per-step from prefix_logp_dists
-    entropies = []
-    for dist in prefix_logp_dists:
-        p = np.exp(dist)
-        ent = -np.sum(p * dist)
-        entropies.append(ent)
-    entropies_t = torch.tensor(entropies, device=device, dtype=torch.float32)
+    assert len(actions) == N
 
     # Now run PPO epochs with minibatching over timesteps
     for epoch in range(ppo_epochs):
@@ -325,28 +274,57 @@ def ppo_update(episodes, ppo_epochs=PPO_EPOCHS, minibatch_size=MINIBATCH_SIZE):
         for start in range(0, N, minibatch_size):
             mb_idx = perm[start:start+minibatch_size]
             mb_idx = list(mb_idx)
-            # pick tensors
+            
+            # Get old values (no grad needed for these)
             mb_logp_old = logps_old_t[mb_idx]
-            mb_logp = logp_current_t[mb_idx]
             mb_advs = advs_t[mb_idx]
             mb_returns = returns_t[mb_idx]
-            mb_values_old = values_old_t[mb_idx]
-            mb_ent = entropies_t[mb_idx]
-            mb_ref_logp = ref_logp_current_t[mb_idx]
+            
+            # Get prefixes and actions for this minibatch
+            mb_prefixes = [prefixes[i] for i in mb_idx]
+            mb_actions = [actions[i] for i in mb_idx]
+            
+            # Batch the prefixes for forward pass
+            maxlen = max(len(x) for x in mb_prefixes)
+            input_ids = []
+            attn = []
+            for seq in mb_prefixes:
+                padded = seq + [tokenizer.pad_token_id] * (maxlen - len(seq))
+                input_ids.append(padded)
+                attn.append([1]*len(seq) + [0]*(maxlen - len(seq)))
+            input_ids = torch.tensor(input_ids, device=device)
+            attn = torch.tensor(attn, device=device)
+            
+            # Forward pass WITH gradients
+            logits, values = policy(input_ids, attention_mask=attn)
+            last_positions = attn.sum(dim=1).long() - 1
+            last_logits = logits[range(len(mb_prefixes)), last_positions, :]
+            log_probs = F.log_softmax(last_logits, dim=-1)
+            
+            # Get logprob and entropy for the actions taken
+            mb_actions_t = torch.tensor(mb_actions, device=device, dtype=torch.long)
+            mb_logp = log_probs[range(len(mb_actions)), mb_actions_t]
+            
+            # Compute entropy
+            probs = F.softmax(last_logits, dim=-1)
+            ent_bonus = -(probs * log_probs).sum(dim=-1).mean()
+            
+            # Get reference logprobs (no grad)
+            with torch.no_grad():
+                ref_output = ref_lm(input_ids=input_ids, attention_mask=attn)
+                ref_logits = ref_output.logits
+                ref_last_logits = ref_logits[range(len(mb_prefixes)), last_positions, :]
+                ref_log_probs = F.log_softmax(ref_last_logits, dim=-1)
+                mb_ref_logp = ref_log_probs[range(len(mb_actions)), mb_actions_t]
 
-            # ratio
+            # PPO loss calculations
             ratio = torch.exp(mb_logp - mb_logp_old)
             surr1 = ratio * mb_advs
             surr2 = torch.clamp(ratio, 1.0 - CLIP_EPS, 1.0 + CLIP_EPS) * mb_advs
             policy_loss = -torch.mean(torch.min(surr1, surr2))
 
-            # value loss (MSE)
-            # compute current value predictions for minibatch using cached values_current_t
-            value_preds = values_current_t[mb_idx]
-            value_loss = F.mse_loss(value_preds, mb_returns)
-
-            # entropy bonus
-            ent_bonus = torch.mean(mb_ent)
+            # value loss (MSE) - values come from current forward pass
+            value_loss = F.mse_loss(values, mb_returns)
 
             # KL penalty (approx): diffs between current and ref logp for taken actions
             kl = torch.mean(mb_logp - mb_ref_logp)
@@ -387,5 +365,18 @@ def main_training_loop(iterations=1000):
 # Note: set RM_CALLABLE to your reward model before running main_training_loop
 # Example: RM_CALLABLE = lambda p, r: your_reward_model.score(p, r)
 
-if __main__ == "__main__":
+
+def init_rm(orm_path):
+    global RM_CALLABLE
+    model = AutoModelForCausalLM.from_pretrained(model_path, device_map = "auto", attn_implementation="eager")  # Specify eager for attention before softmax
+    orm = OutcomeRewardModel(model)
+    orm.load_state_dict(torch.load(orm_path, map_location = orm.device), strict = False)
+    orm.eval()
+    for p in orm.parameters(): p.requires_grad = False
+    RM_CALLABLE = lambda prompt, response: orm(**tokenizer(prompt + response, return_tensors="pt").to(orm.device)).item()
+    # # Dummy reward model: reward is length of response (for testing)
+    # RM_CALLABLE = lambda prompt, response: len(response.split())
+
+if __name__ == "__main__":
+    init_rm("../reward_model.pt")
     main_training_loop()
